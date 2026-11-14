@@ -9,6 +9,7 @@ function loadServerDB() {
       overrides: {},
       deletedUsers: [],
       loginLogs: [],
+      resetAt: 0,
       updatedAt: Date.now(),
     };
   }
@@ -20,6 +21,7 @@ function loadServerDB() {
           overrides: parsed.overrides || {},
           deletedUsers: Array.isArray(parsed.deletedUsers) ? parsed.deletedUsers : [],
           loginLogs: Array.isArray(parsed.loginLogs) ? parsed.loginLogs : [],
+          resetAt: Number(parsed.resetAt || 0),
           updatedAt: parsed.updatedAt || Date.now(),
         };
       }
@@ -42,7 +44,7 @@ export const handler = async (event) => {
     'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Allow-Headers': 'Content-Type, Cache-Control, Pragma, Authorization',
   };
 
   if (event.httpMethod === 'OPTIONS') {
@@ -60,7 +62,33 @@ export const handler = async (event) => {
       const body = JSON.parse(event.body || '{}');
       const action = body.action;
 
-      if (action === 'UPSERT_USER' && body.account) {
+      if (action === 'RESET_ALL') {
+        const now = Date.now();
+        const prevAdmin = db.overrides?.admin;
+        const nextOverrides = {};
+        if (body.preserveAdminAuth && prevAdmin && prevAdmin.passwordHash) {
+          nextOverrides.admin = {
+            username: 'admin',
+            academicId: prevAdmin.academicId || 'ADMIN-001',
+            fullName: prevAdmin.fullName || 'المشرف العام على المنصة',
+            role: 'admin',
+            registrationSource: 'system_admin',
+            passwordHash: prevAdmin.passwordHash,
+            passwordSalt: prevAdmin.passwordSalt,
+            isDeleted: false,
+            deletedAt: 0,
+            lastLoginAt: 0,
+            loginCount: 0,
+            createdAt: prevAdmin.createdAt || now,
+            updatedAt: now,
+          };
+        }
+        db.overrides = nextOverrides;
+        db.deletedUsers = [];
+        db.loginLogs = [];
+        db.resetAt = Math.max(Number(body.resetAt || 0), now);
+        saveServerDB(db);
+      } else if (action === 'UPSERT_USER' && body.account) {
         const acc = body.account;
         const cleanU = String(acc.username || '').toLowerCase().trim();
         const cleanAcad = String(acc.academicId || '').toLowerCase().trim();
@@ -121,47 +149,85 @@ export const handler = async (event) => {
         }
         const lu = String(log.username || '').toLowerCase().trim();
         const delSet = new Set(db.deletedUsers || []);
-        if (lu && log.status === 'success' && !delSet.has(lu) && db.overrides[lu] && !db.overrides[lu].isDeleted) {
-          db.overrides[lu].lastLoginAt = log.timestamp || Date.now();
-          db.overrides[lu].loginCount = Number(db.overrides[lu].loginCount || 0) + 1;
-          db.overrides[lu].updatedAt = Date.now();
+        if (
+          lu &&
+          log.status === 'success' &&
+          log.authMethod !== 'registration' &&
+          !delSet.has(lu)
+        ) {
+          const prev = db.overrides[lu] || { username: lu, role: log.role || 'user', createdAt: log.timestamp || Date.now() };
+          if (!prev.isDeleted) {
+            db.overrides[lu] = {
+              ...prev,
+              username: lu,
+              academicId: prev.academicId || log.academicId || lu,
+              fullName: prev.fullName || log.fullName || lu,
+              lastLoginAt: Math.max(Number(prev.lastLoginAt || 0), Number(log.timestamp || Date.now())),
+              loginCount: Number(prev.loginCount || 0) + 1,
+              updatedAt: Date.now(),
+            };
+          }
         }
         saveServerDB(db);
       } else if (action === 'SYNC_MERGE' && body.localOverrides) {
-        const delSet = new Set(db.deletedUsers || []);
-        for (const [k, rec] of Object.entries(body.localOverrides)) {
-          const cleanK = String(rec.username || k).toLowerCase().trim();
-          if (!cleanK) continue;
-          const cleanAcad = String(rec.academicId || '').toLowerCase().trim();
-          if (rec.isDeleted && cleanK !== 'admin') {
-            delSet.add(cleanK);
-            if (cleanAcad) delSet.add(cleanAcad);
-            db.overrides[cleanK] = {
-              username: cleanK,
-              academicId: cleanAcad || cleanK,
-              isDeleted: true,
-              deletedAt: rec.deletedAt || Date.now(),
-              password: '',
-              passwordHash: '',
-              passwordSalt: '',
-              updatedAt: rec.updatedAt || Date.now(),
-            };
-          } else if (!delSet.has(cleanK) && (!cleanAcad || !delSet.has(cleanAcad))) {
-            const existing = db.overrides[cleanK];
-            if (!existing || ((rec.updatedAt || 0) > (existing.updatedAt || 0) && !existing.isDeleted)) {
+        const clientSyncBaseline = Number(body.lastResetAt || 0);
+        const serverResetAt = Number(db.resetAt || 0);
+        const allowMergeFromClient = serverResetAt === 0 || clientSyncBaseline >= serverResetAt;
+
+        if (allowMergeFromClient) {
+          const delSet = new Set(db.deletedUsers || []);
+          for (const [k, rec] of Object.entries(body.localOverrides)) {
+            const cleanK = String(rec.username || k).toLowerCase().trim();
+            if (!cleanK) continue;
+            const cleanAcad = String(rec.academicId || '').toLowerCase().trim();
+            if (rec.isDeleted && cleanK !== 'admin') {
+              delSet.add(cleanK);
+              if (cleanAcad) delSet.add(cleanAcad);
               db.overrides[cleanK] = {
-                ...existing,
-                ...rec,
                 username: cleanK,
-                password: rec.password || existing?.password || '',
-                passwordHash: rec.passwordHash || existing?.passwordHash || '',
-                passwordSalt: rec.passwordSalt || existing?.passwordSalt || '',
+                academicId: cleanAcad || cleanK,
+                isDeleted: true,
+                deletedAt: rec.deletedAt || Date.now(),
+                password: '',
+                passwordHash: '',
+                passwordSalt: '',
+                updatedAt: rec.updatedAt || Date.now(),
               };
+            } else if (!delSet.has(cleanK) && (!cleanAcad || !delSet.has(cleanAcad))) {
+              const existing = db.overrides[cleanK];
+              if (!existing || ((rec.updatedAt || 0) > (existing.updatedAt || 0) && !existing.isDeleted)) {
+                db.overrides[cleanK] = {
+                  ...existing,
+                  ...rec,
+                  username: cleanK,
+                  password: rec.password || existing?.password || '',
+                  passwordHash: rec.passwordHash || existing?.passwordHash || '',
+                  passwordSalt: rec.passwordSalt || existing?.passwordSalt || '',
+                };
+              }
             }
           }
+          if (Array.isArray(body.localLoginLogs)) {
+            const logMap = new Map();
+            for (const l of db.loginLogs || []) {
+              if (l && l.id) logMap.set(l.id, l);
+            }
+            for (const l of body.localLoginLogs) {
+              if (l && l.id && Number(l.timestamp || 0) >= serverResetAt) {
+                const lu = String(l.username || '').toLowerCase().trim();
+                const la = String(l.academicId || '').toLowerCase().trim();
+                if (!delSet.has(lu) && (!la || !delSet.has(la))) {
+                  logMap.set(l.id, l);
+                }
+              }
+            }
+            db.loginLogs = Array.from(logMap.values())
+              .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+              .slice(0, 300);
+          }
+          db.deletedUsers = Array.from(delSet);
+          saveServerDB(db);
         }
-        db.deletedUsers = Array.from(delSet);
-        saveServerDB(db);
       }
       return { statusCode: 200, headers, body: JSON.stringify({ ok: true, ...db }) };
     } catch (err) {

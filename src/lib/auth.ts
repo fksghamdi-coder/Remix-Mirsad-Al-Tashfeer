@@ -40,6 +40,7 @@ import {
   pushAdminAccountOverride,
   getLocalAccountOverrides,
   permanentlyDeleteAccountFromCentralDB,
+  ensureOneTimeFullResetEpoch,
 } from './centralAdminDB';
 
 export type UserRole = 'admin' | 'doctor' | 'user' | 'guest';
@@ -397,7 +398,12 @@ export function getUserPasswordDetails(user: StoredUser): { password: string; is
     return { password: user.plainPassword, isDefault: user.isDefaultPassword !== false };
   }
 
-  // 4. الرقم السري الافتراضي للحسابات الرسمية
+  // 4. إذا كان الحساب مشفّراً مسبقاً بدون نص صريح
+  if (user.passwordHash && (user.role === 'admin' || !user.isDefaultPassword)) {
+    return { password: 'مشفّر (PBKDF2)', isDefault: false };
+  }
+
+  // 5. الرقم السري الافتراضي للحسابات الرسمية
   const defaultPw =
     DEFAULT_OFFICIAL_PASSWORDS[user.username.toLowerCase()] ||
     (user.academicId && DEFAULT_OFFICIAL_PASSWORDS[user.academicId]) ||
@@ -632,6 +638,13 @@ export async function initializeAuth(): Promise<void> {
 
     if (hasStorage() && !localStorage.getItem(FIRST_LOGIN_RESET_VERSION_KEY)) {
       localStorage.setItem(FIRST_LOGIN_RESET_VERSION_KEY, String(Date.now()));
+    }
+
+    const didEpochReset = await ensureOneTimeFullResetEpoch();
+    if (didEpochReset) {
+      clearAllLoginAndSessionStorage();
+      usersCache = buildOfficialAccountsList();
+      mergeOverridesIntoUsersCache();
     }
 
     // 1) تحميل المستخدمين مع استبعاد أي حساب محذوف نهائياً
@@ -1044,14 +1057,16 @@ export async function login(
     rec.count += 1;
     rec.last = Date.now();
     await logSecurityEvent('login_failed', { reason: user ? 'wrong_password' : 'unknown_identifier', attempts: rec.count }, clean);
-    void recordRealLoginActivity({
-      username: user ? user.username : clean,
-      fullName: user ? user.fullName : clean,
-      academicId: user ? user.academicId || user.username : clean,
-      role: user ? user.role : 'user',
-      status: 'failed',
-      authMethod: 'password',
-    });
+    try {
+      await recordRealLoginActivity({
+        username: user ? user.username : clean,
+        fullName: user ? user.fullName : clean,
+        academicId: user ? user.academicId || user.username : clean,
+        role: user ? user.role : 'user',
+        status: 'failed',
+        authMethod: 'password',
+      });
+    } catch {}
     if (user) await detectAnomalies(user.username);
 
     if (rec.count >= MAX_ATTEMPTS) {
@@ -1209,7 +1224,7 @@ export async function registerUser(
     academicId: cleanAcademicId,
     role: targetRole,
     status: 'success',
-    authMethod: 'password',
+    authMethod: 'registration',
     note:
       resolvedSource === 'admin_created'
         ? 'تم إنشاء وتفعيل الحساب بواسطة المشرف العام (Admin)'

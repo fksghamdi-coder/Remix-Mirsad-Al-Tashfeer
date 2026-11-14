@@ -5,6 +5,9 @@ import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { requireAuth, type AuthenticatedRequest } from './src/middleware/auth.ts';
 import { getOrCreateUser, getAllUsers, deleteUserById } from './src/db/users.ts';
+import { db as sqlDb } from './src/db/index.ts';
+import { users as sqlUsers, auditLogs as sqlAuditLogs, loginSessions as sqlLoginSessions } from './src/db/schema.ts';
+import { ne, eq } from 'drizzle-orm';
 
 const PORT = 3000;
 
@@ -99,6 +102,7 @@ interface MirsadServerDBState {
   overrides: Record<string, ServerAccountRecord>;
   deletedUsers: string[];
   loginLogs: ServerLoginLogRecord[];
+  resetAt: number;
   updatedAt: number;
 }
 
@@ -116,27 +120,54 @@ function loadCentralServerDB(): MirsadServerDBState {
       overrides: {},
       deletedUsers: [],
       loginLogs: [],
-      updatedAt: Date.now(),
+      resetAt: 0,
+      updatedAt: 0,
     };
   }
+  let bestState = globalThis.__MIRSAD_SERVER_DB__;
   for (const filePath of [PERSISTENT_ACCOUNTS_DB_FILE, TMP_ACCOUNTS_DB_FILE]) {
     try {
       if (fs.existsSync(filePath)) {
         const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as Partial<MirsadServerDBState>;
         if (parsed && typeof parsed === 'object') {
-          globalThis.__MIRSAD_SERVER_DB__ = {
-            overrides: { ...(globalThis.__MIRSAD_SERVER_DB__?.overrides || {}), ...(parsed.overrides || {}) },
-            deletedUsers: Array.from(new Set([...(globalThis.__MIRSAD_SERVER_DB__?.deletedUsers || []), ...(Array.isArray(parsed.deletedUsers) ? parsed.deletedUsers : [])])),
-            loginLogs: Array.isArray(parsed.loginLogs) && parsed.loginLogs.length > 0 ? parsed.loginLogs : (globalThis.__MIRSAD_SERVER_DB__?.loginLogs || []),
-            updatedAt: Math.max(globalThis.__MIRSAD_SERVER_DB__?.updatedAt || 0, parsed.updatedAt || Date.now()),
-          };
+          const parsedResetAt = Number(parsed.resetAt || 0);
+          const parsedUpdatedAt = Number(parsed.updatedAt || 0);
+          const bestResetAt = Number(bestState.resetAt || 0);
+          const bestUpdatedAt = Number(bestState.updatedAt || 0);
+
+          if (parsedResetAt > bestResetAt) {
+            bestState = {
+              overrides: parsed.overrides || {},
+              deletedUsers: Array.isArray(parsed.deletedUsers) ? parsed.deletedUsers : [],
+              loginLogs: Array.isArray(parsed.loginLogs) ? parsed.loginLogs : [],
+              resetAt: parsedResetAt,
+              updatedAt: parsedUpdatedAt || Date.now(),
+            };
+          } else if (parsedResetAt === bestResetAt && parsedUpdatedAt >= bestUpdatedAt) {
+            bestState = {
+              overrides: { ...(bestState.overrides || {}), ...(parsed.overrides || {}) },
+              deletedUsers: Array.from(
+                new Set([
+                  ...(bestState.deletedUsers || []),
+                  ...(Array.isArray(parsed.deletedUsers) ? parsed.deletedUsers : []),
+                ])
+              ),
+              loginLogs: Array.isArray(parsed.loginLogs) ? parsed.loginLogs : (bestState.loginLogs || []),
+              resetAt: Math.max(bestResetAt, parsedResetAt),
+              updatedAt: Math.max(bestUpdatedAt, parsedUpdatedAt, Date.now()),
+            };
+          }
         }
       }
     } catch {
       // ignore file read errors
     }
   }
-  return globalThis.__MIRSAD_SERVER_DB__;
+  if (!bestState.updatedAt) {
+    bestState.updatedAt = Date.now();
+  }
+  globalThis.__MIRSAD_SERVER_DB__ = bestState;
+  return bestState;
 }
 
 function saveCentralServerDB(state: MirsadServerDBState): void {
@@ -158,19 +189,115 @@ function saveCentralServerDB(state: MirsadServerDBState): void {
   }
 }
 
+async function mirrorResetToCloudSql(preserveAdminAuth: boolean): Promise<void> {
+  try {
+    await sqlDb.delete(sqlLoginSessions);
+    await sqlDb.delete(sqlAuditLogs);
+    if (preserveAdminAuth) {
+      await sqlDb.delete(sqlUsers).where(ne(sqlUsers.username, 'admin'));
+      await sqlDb
+        .update(sqlUsers)
+        .set({
+          loginCount: 0,
+          lastLoginAt: null,
+          failedAttempts: 0,
+          lockedUntil: null,
+          updatedAt: new Date(),
+        })
+        .where(eq(sqlUsers.username, 'admin'));
+    } else {
+      await sqlDb.delete(sqlUsers);
+    }
+  } catch {
+    // Cloud SQL optional in environments without SQL_HOST
+  }
+}
+
+async function mirrorUpsertUserToCloudSql(acc: ServerAccountRecord): Promise<void> {
+  try {
+    const cleanU = String(acc.username || '').toLowerCase().trim();
+    if (!cleanU || acc.isDeleted) return;
+    await getOrCreateUser(cleanU, `${cleanU}@mirsad.local`, {
+      username: cleanU,
+      name: String(acc.fullName || cleanU),
+      role: String(acc.role || 'user'),
+      status: 'active',
+      passwordHash: acc.passwordHash ? String(acc.passwordHash) : undefined,
+      passwordSalt: acc.passwordSalt ? String(acc.passwordSalt) : undefined,
+      lastLoginAt: acc.lastLoginAt ? new Date(Number(acc.lastLoginAt)) : undefined,
+      loginCount: typeof acc.loginCount === 'number' ? acc.loginCount : undefined,
+    });
+  } catch {
+    // non-blocking
+  }
+}
+
+async function mirrorDeleteUserToCloudSql(username: string): Promise<void> {
+  try {
+    const cleanU = username.toLowerCase().trim();
+    if (!cleanU || cleanU === 'admin') return;
+    await sqlDb.delete(sqlUsers).where(eq(sqlUsers.id, cleanU));
+  } catch {
+    // non-blocking
+  }
+}
+
+async function mirrorLoginLogToCloudSql(log: ServerLoginLogRecord, account?: ServerAccountRecord): Promise<void> {
+  try {
+    const lu = String(log.username || '').toLowerCase().trim();
+    if (account && lu && !account.isDeleted) {
+      await mirrorUpsertUserToCloudSql(account);
+    }
+    await sqlDb
+      .insert(sqlAuditLogs)
+      .values({
+        id: String(log.id),
+        userId: account && !account.isDeleted ? lu : null,
+        userEmail: `${lu || 'unknown'}@mirsad.local`,
+        action:
+          log.status === 'success'
+            ? String(log.authMethod || '') === 'registration'
+              ? 'USER_REGISTERED'
+              : 'USER_LOGIN_SUCCESS'
+            : log.status === 'logout'
+            ? 'USER_LOGOUT'
+            : 'USER_LOGIN_FAILED',
+        details: String(log.note || ''),
+        severity: log.status === 'failed' ? 'warning' : 'info',
+        prevHash: log.prevHash ? String(log.prevHash) : null,
+        hash: log.hash ? String(log.hash) : null,
+      })
+      .onConflictDoNothing();
+  } catch {
+    // non-blocking
+  }
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '2mb' }));
 
   // Central Accounts & Login Activity Sync API (GET & POST /api/accounts)
-  app.get('/api/accounts', (_req, res) => {
+  const applyAccountsHeaders = (res: express.Response) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Cache-Control, Pragma, Authorization');
+  };
+
+  app.options('/api/accounts', (_req, res) => {
+    applyAccountsHeaders(res);
+    res.status(204).end();
+  });
+
+  app.get('/api/accounts', (_req, res) => {
+    applyAccountsHeaders(res);
     const db = loadCentralServerDB();
     res.json({ ok: true, ...db });
   });
 
-  app.post('/api/accounts', (req, res) => {
-    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0');
+  app.post('/api/accounts', async (req, res) => {
+    applyAccountsHeaders(res);
     try {
       const db = loadCentralServerDB();
       const body = (req.body || {}) as {
@@ -180,10 +307,42 @@ async function startServer() {
         academicId?: string;
         log?: ServerLoginLogRecord;
         localOverrides?: Record<string, ServerAccountRecord>;
+        localLoginLogs?: ServerLoginLogRecord[];
+        lastResetAt?: number;
+        resetAt?: number;
+        preserveAdminAuth?: boolean;
       };
       const action = body.action;
 
-      if (action === 'UPSERT_USER' && body.account) {
+      if (action === 'RESET_ALL') {
+        const now = Date.now();
+        const prevAdmin = db.overrides?.admin;
+        const preserveAdminAuth = body.preserveAdminAuth !== false;
+        const nextOverrides: Record<string, ServerAccountRecord> = {};
+        if (preserveAdminAuth && prevAdmin && prevAdmin.passwordHash) {
+          nextOverrides.admin = {
+            username: 'admin',
+            academicId: prevAdmin.academicId || 'ADMIN-001',
+            fullName: prevAdmin.fullName || 'المشرف العام على المنصة',
+            role: 'admin',
+            registrationSource: 'system_admin',
+            passwordHash: prevAdmin.passwordHash,
+            passwordSalt: prevAdmin.passwordSalt,
+            isDeleted: false,
+            deletedAt: 0,
+            lastLoginAt: 0,
+            loginCount: 0,
+            createdAt: prevAdmin.createdAt || now,
+            updatedAt: now,
+          };
+        }
+        db.overrides = nextOverrides;
+        db.deletedUsers = [];
+        db.loginLogs = [];
+        db.resetAt = Math.max(Number(body.resetAt || 0), now);
+        saveCentralServerDB(db);
+        await mirrorResetToCloudSql(preserveAdminAuth);
+      } else if (action === 'UPSERT_USER' && body.account) {
         const acc = body.account;
         const cleanU = String(acc.username || '').toLowerCase().trim();
         const cleanAcad = String(acc.academicId || '').toLowerCase().trim();
@@ -205,6 +364,7 @@ async function startServer() {
           if (cleanAcad) delSet.delete(cleanAcad);
           db.deletedUsers = Array.from(delSet);
           saveCentralServerDB(db);
+          void mirrorUpsertUserToCloudSql(db.overrides[cleanU]);
         }
       } else if (action === 'DELETE_USER') {
         const cleanU = String(body.username || '').toLowerCase().trim();
@@ -236,6 +396,7 @@ async function startServer() {
             return lu !== cleanU && la !== cleanU && (!resolvedAcad || (lu !== resolvedAcad && la !== resolvedAcad));
           });
           saveCentralServerDB(db);
+          void mirrorDeleteUserToCloudSql(cleanU);
         }
       } else if (action === 'ADD_LOGIN_LOG' && body.log) {
         const log = body.log;
@@ -244,47 +405,90 @@ async function startServer() {
         }
         const lu = String(log.username || '').toLowerCase().trim();
         const delSet = new Set(db.deletedUsers || []);
-        if (lu && log.status === 'success' && !delSet.has(lu) && db.overrides[lu] && !db.overrides[lu].isDeleted) {
-          db.overrides[lu].lastLoginAt = log.timestamp || Date.now();
-          db.overrides[lu].loginCount = Number(db.overrides[lu].loginCount || 0) + 1;
-          db.overrides[lu].updatedAt = Date.now();
-        }
-        saveCentralServerDB(db);
-      } else if (action === 'SYNC_MERGE' && body.localOverrides) {
-        const delSet = new Set(db.deletedUsers || []);
-        for (const [k, rec] of Object.entries(body.localOverrides)) {
-          const cleanK = String(rec.username || k).toLowerCase().trim();
-          if (!cleanK) continue;
-          const cleanAcad = String(rec.academicId || '').toLowerCase().trim();
-          if (rec.isDeleted && cleanK !== 'admin') {
-            delSet.add(cleanK);
-            if (cleanAcad) delSet.add(cleanAcad);
-            db.overrides[cleanK] = {
-              username: cleanK,
-              academicId: cleanAcad || cleanK,
-              isDeleted: true,
-              deletedAt: rec.deletedAt || Date.now(),
-              password: '',
-              passwordHash: '',
-              passwordSalt: '',
-              updatedAt: rec.updatedAt || Date.now(),
+        if (
+          lu &&
+          log.status === 'success' &&
+          String(log.authMethod || '') !== 'registration' &&
+          !delSet.has(lu)
+        ) {
+          const prev = db.overrides[lu] || {
+            username: lu,
+            role: String(log.role || 'user'),
+            createdAt: Number(log.timestamp || Date.now()),
+          };
+          if (!prev.isDeleted) {
+            db.overrides[lu] = {
+              ...prev,
+              username: lu,
+              academicId: prev.academicId || String(log.academicId || lu),
+              fullName: prev.fullName || String(log.fullName || lu),
+              lastLoginAt: Math.max(Number(prev.lastLoginAt || 0), Number(log.timestamp || Date.now())),
+              loginCount: Number(prev.loginCount || 0) + 1,
+              updatedAt: Date.now(),
             };
-          } else if (!delSet.has(cleanK) && (!cleanAcad || !delSet.has(cleanAcad))) {
-            const existing = db.overrides[cleanK];
-            if (!existing || ((rec.updatedAt || 0) > (existing.updatedAt || 0) && !existing.isDeleted)) {
-              db.overrides[cleanK] = {
-                ...existing,
-                ...rec,
-                username: cleanK,
-                password: rec.password || existing?.password || '',
-                passwordHash: rec.passwordHash || existing?.passwordHash || '',
-                passwordSalt: rec.passwordSalt || existing?.passwordSalt || '',
-              };
-            }
           }
         }
-        db.deletedUsers = Array.from(delSet);
         saveCentralServerDB(db);
+        void mirrorLoginLogToCloudSql(log, lu ? db.overrides[lu] : undefined);
+      } else if (action === 'SYNC_MERGE' && body.localOverrides) {
+        const clientSyncBaseline = Number(body.lastResetAt || 0);
+        const serverResetAt = Number(db.resetAt || 0);
+        const allowMergeFromClient = serverResetAt === 0 || clientSyncBaseline >= serverResetAt;
+
+        if (allowMergeFromClient) {
+          const delSet = new Set(db.deletedUsers || []);
+          for (const [k, rec] of Object.entries(body.localOverrides)) {
+            const cleanK = String(rec.username || k).toLowerCase().trim();
+            if (!cleanK) continue;
+            const cleanAcad = String(rec.academicId || '').toLowerCase().trim();
+            if (rec.isDeleted && cleanK !== 'admin') {
+              delSet.add(cleanK);
+              if (cleanAcad) delSet.add(cleanAcad);
+              db.overrides[cleanK] = {
+                username: cleanK,
+                academicId: cleanAcad || cleanK,
+                isDeleted: true,
+                deletedAt: rec.deletedAt || Date.now(),
+                password: '',
+                passwordHash: '',
+                passwordSalt: '',
+                updatedAt: rec.updatedAt || Date.now(),
+              };
+            } else if (!delSet.has(cleanK) && (!cleanAcad || !delSet.has(cleanAcad))) {
+              const existing = db.overrides[cleanK];
+              if (!existing || ((rec.updatedAt || 0) > (existing.updatedAt || 0) && !existing.isDeleted)) {
+                db.overrides[cleanK] = {
+                  ...existing,
+                  ...rec,
+                  username: cleanK,
+                  password: rec.password || existing?.password || '',
+                  passwordHash: rec.passwordHash || existing?.passwordHash || '',
+                  passwordSalt: rec.passwordSalt || existing?.passwordSalt || '',
+                };
+              }
+            }
+          }
+          if (Array.isArray(body.localLoginLogs)) {
+            const logMap = new Map<string, ServerLoginLogRecord>();
+            for (const l of db.loginLogs || []) {
+              if (l && l.id) logMap.set(l.id, l);
+            }
+            for (const l of body.localLoginLogs) {
+              if (l && l.id && Number(l.timestamp || 0) >= serverResetAt) {
+                const lu = String(l.username || '').toLowerCase().trim();
+                const la = String(l.academicId || '').toLowerCase().trim();
+                if (!delSet.has(lu) && (!la || !delSet.has(la))) {
+                  logMap.set(l.id, l);
+                }
+              }
+            }
+            db.loginLogs = Array.from(logMap.values())
+              .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+              .slice(0, 300);
+          }
+          db.deletedUsers = Array.from(delSet);
+          saveCentralServerDB(db);
+        }
       }
 
       res.json({ ok: true, ...db });

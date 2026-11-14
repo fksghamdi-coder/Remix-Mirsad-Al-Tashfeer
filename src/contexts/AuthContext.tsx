@@ -16,6 +16,7 @@ import { sanitizeId, truncateString } from '@/lib/utils';
 import { useNavigate } from 'react-router-dom';
 import { initSyncEngine } from '@/lib/syncEngine';
 import { registerSession, clearToken } from '@/lib/sessionManager';
+import { recordRealLoginActivity } from '@/lib/centralAdminDB';
 
 interface AuthCtx {
   session: UserSession | null;
@@ -74,6 +75,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const logout = async () => {
+    const active = session || getSession();
+    if (active && active.username && active.username !== '__guest__') {
+      try {
+        await recordRealLoginActivity({
+          username: active.username,
+          fullName: active.fullName || active.username,
+          academicId: active.username,
+          role: active.role,
+          status: 'logout',
+          authMethod: active.authMode === 'firebase' ? 'google_oauth' : 'password',
+        });
+      } catch {
+        // ignore
+      }
+    }
     try {
       if (auth.currentUser) {
         await signOut(auth);
@@ -249,16 +265,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         exitGuestMode();
         const uid = sanitizeId(cred.user.uid);
         const logId = sanitizeId(`log_${Date.now()}_${uid.slice(0, 8)}`);
+        const isBootstrappedAdmin =
+          cred.user.emailVerified && cred.user.email === 'fk.sghamdi@gmail.com';
+        const displayName = truncateString(
+          cred.user.displayName || cred.user.email?.split('@')[0] || 'User',
+          100,
+          1,
+          'User'
+        );
+        const username = truncateString(
+          (cred.user.email?.split('@')[0] || uid).replace(/[^a-zA-Z0-9_\-.]/g, '_'),
+          64,
+          3,
+          'user_1'
+        );
+        try {
+          await recordRealLoginActivity({
+            username,
+            fullName: displayName,
+            academicId: uid,
+            role: isBootstrappedAdmin ? 'admin' : 'user',
+            status: 'success',
+            authMethod: 'google_oauth',
+            note: 'تسجيل دخول موثق عبر مصادقة Google السحابية المركزية',
+          });
+        } catch {
+          // ignore
+        }
         if (cred.user.emailVerified) {
           try {
             await setDoc(doc(db, 'audit_logs', logId), {
               uid,
-              actorName: truncateString(
-                cred.user.displayName || cred.user.email || 'User',
-                100,
-                1,
-                'User'
-              ),
+              actorName: displayName,
               action: 'GOOGLE_OAUTH_LOGIN',
               category: 'auth',
               details: 'تسجيل دخول موثق عبر مصادقة Google السحابية المركزية',

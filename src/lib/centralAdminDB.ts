@@ -40,7 +40,7 @@ export interface LoginActivityRecord {
   academicId: string;
   role: 'admin' | 'doctor' | 'user' | 'guest';
   status: 'success' | 'failed' | 'logout';
-  authMethod: 'password' | 'google_oauth' | 'admin_reset';
+  authMethod: 'password' | 'google_oauth' | 'admin_reset' | 'registration';
   timestamp: number;
   isoDate: string;
   userAgent: string;
@@ -74,6 +74,26 @@ const ACCOUNT_OVERRIDES_STORAGE_KEY = 'mirsad_central_account_overrides_v1';
 const DELETED_USERS_STORAGE_KEY = 'mirsad_deleted_users_v1';
 const ACTIVE_PASSWORDS_STORAGE_KEY = 'mirsad_user_active_passwords_v1';
 const ONE_TIME_INITIAL_PURGE_KEY = 'mirsad_initial_10_students_purged_v3';
+const LAST_RESET_AT_KEY = 'mirsad_last_reset_at_v1';
+const FULL_RESET_EPOCH_KEY = 'mirsad_full_reset_epoch_2026_11_14_v1';
+
+export function getLastResetAt(): number {
+  if (!hasLocalStorage()) return 0;
+  try {
+    const raw = localStorage.getItem(LAST_RESET_AT_KEY);
+    const parsed = Number(raw || 0);
+    return Number.isFinite(parsed) ? parsed : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function setLastResetAt(ts: number): void {
+  if (!hasLocalStorage()) return;
+  try {
+    localStorage.setItem(LAST_RESET_AT_KEY, String(ts));
+  } catch {}
+}
 
 function hasLocalStorage(): boolean {
   return typeof window !== 'undefined' && typeof localStorage !== 'undefined';
@@ -102,6 +122,7 @@ async function callServerAccountsApi(
   overrides?: Record<string, CentralAccountOverride>;
   deletedUsers?: string[];
   loginLogs?: LoginActivityRecord[];
+  resetAt?: number;
 } | null> {
   if (typeof window === 'undefined' || typeof fetch === 'undefined') return null;
   for (const endpoint of getAccountsApiEndpoints()) {
@@ -150,6 +171,220 @@ export async function purgeAllNonAdminAccountsAndSecrets(): Promise<void> {
       localStorage.setItem(ONE_TIME_INITIAL_PURGE_KEY, '1');
     }
   } catch {}
+}
+
+export async function applyLocalResetPurge(
+  resetAt: number,
+  options: { clearActiveSession?: boolean; preserveAdminAuth?: boolean } = {}
+): Promise<CentralAccountOverride | null> {
+  const preserveAdminAuth = options.preserveAdminAuth !== false;
+  let preservedAdmin: CentralAccountOverride | null = null;
+
+  if (hasLocalStorage()) {
+    try {
+      const currentOverrides = getLocalAccountOverrides();
+      const prevAdmin = currentOverrides.admin;
+      const customPwRaw = localStorage.getItem(ACTIVE_PASSWORDS_STORAGE_KEY);
+      const customPwMap = customPwRaw ? JSON.parse(customPwRaw) : {};
+      const adminPw = customPwMap?.admin || customPwMap?.['admin-001'];
+
+      if (preserveAdminAuth && (prevAdmin?.passwordHash || adminPw?.passwordHash)) {
+        preservedAdmin = {
+          username: 'admin',
+          academicId: prevAdmin?.academicId || 'ADMIN-001',
+          fullName: prevAdmin?.fullName || 'المشرف العام على المنصة',
+          phone: prevAdmin?.phone || '',
+          role: 'admin',
+          registrationSource: 'system_admin',
+          passwordHash: prevAdmin?.passwordHash || adminPw?.passwordHash || '',
+          passwordSalt: prevAdmin?.passwordSalt || adminPw?.passwordSalt || '',
+          isDeleted: false,
+          deletedAt: 0,
+          lastLoginAt: 0,
+          loginCount: 0,
+          createdAt: prevAdmin?.createdAt || resetAt,
+          updatedAt: resetAt,
+        };
+      }
+
+      if (preservedAdmin) {
+        localStorage.setItem(ACCOUNT_OVERRIDES_STORAGE_KEY, JSON.stringify({ admin: preservedAdmin }));
+      } else {
+        localStorage.removeItem(ACCOUNT_OVERRIDES_STORAGE_KEY);
+      }
+
+      if (preserveAdminAuth && adminPw && (adminPw.passwordHash || adminPw.password)) {
+        localStorage.setItem(
+          ACTIVE_PASSWORDS_STORAGE_KEY,
+          JSON.stringify({
+            admin: {
+              password: adminPw.password || '',
+              passwordHash: adminPw.passwordHash || preservedAdmin?.passwordHash || '',
+              passwordSalt: adminPw.passwordSalt || preservedAdmin?.passwordSalt || '',
+              updatedAt: resetAt,
+            },
+          })
+        );
+      } else {
+        localStorage.removeItem(ACTIVE_PASSWORDS_STORAGE_KEY);
+      }
+
+      const keysToRemove = [
+        LOGIN_LOGS_STORAGE_KEY,
+        DELETED_USERS_STORAGE_KEY,
+        'mirsad_audit_logs_v1',
+        'mirsad_dashboard_users',
+        'mirsad_attempts_v1',
+        'mirsad_otp_v1',
+        'mirsad_admin_password_reset_requests_v1',
+        'mirsad_security_events_v1',
+        'mirsad_security_logs_v1',
+        'mirsad_users_v3',
+      ];
+      if (options.clearActiveSession) {
+        keysToRemove.push('mirsad_session_v3', 'mirsad_jwt_token', 'mirsad_guest_mode');
+      }
+      for (const k of keysToRemove) {
+        localStorage.removeItem(k);
+      }
+
+      const dynamicKeys: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (
+          k &&
+          (k.startsWith('mirsad_rate_limit_') ||
+            k.startsWith('mirsad_congrats_seen_') ||
+            k.startsWith('mirsad_cards_') ||
+            k.startsWith('mirsad_attempts'))
+        ) {
+          dynamicKeys.push(k);
+        }
+      }
+      for (const k of dynamicKeys) {
+        localStorage.removeItem(k);
+      }
+
+      setLastResetAt(resetAt);
+    } catch {}
+  }
+
+  try {
+    const allUsers = await getAllRecords<{ username: string }>('users');
+    for (const r of allUsers) {
+      const uname = (r.username || '').toLowerCase().trim();
+      if (!preserveAdminAuth || uname !== 'admin') {
+        await deleteRecord('users', r.username);
+      }
+    }
+  } catch {}
+
+  broadcastSyncUpdate();
+  return preservedAdmin;
+}
+
+export async function resetAllAccountsAndLoginsGlobally(
+  options: { clearActiveSession?: boolean; preserveAdminAuth?: boolean } = {}
+): Promise<{ ok: boolean; resetAt: number }> {
+  const now = Date.now();
+  const preserveAdminAuth = options.preserveAdminAuth !== false;
+
+  if (hasLocalStorage()) {
+    try {
+      localStorage.setItem(FULL_RESET_EPOCH_KEY, '1');
+    } catch {}
+  }
+
+  const preservedAdmin = await applyLocalResetPurge(now, options);
+
+  await callServerAccountsApi('POST', {
+    action: 'RESET_ALL',
+    resetAt: now,
+    preserveAdminAuth,
+  });
+
+  try {
+    const [regSnap, logsSnap, usersSnap, auditSnap] = await Promise.all([
+      getDocs(collection(firestoreDB, 'mirsad_registered_users')).catch(() => null),
+      getDocs(collection(firestoreDB, 'mirsad_login_logs')).catch(() => null),
+      getDocs(collection(firestoreDB, 'users')).catch(() => null),
+      getDocs(collection(firestoreDB, 'audit_logs')).catch(() => null),
+    ]);
+
+    const deletions: Array<Promise<void>> = [];
+    regSnap?.forEach((d) => {
+      if (!preserveAdminAuth || d.id.toLowerCase() !== 'admin') {
+        deletions.push(deleteDoc(d.ref).catch(() => {}));
+      }
+    });
+    logsSnap?.forEach((d) => {
+      deletions.push(deleteDoc(d.ref).catch(() => {}));
+    });
+    usersSnap?.forEach((d) => {
+      deletions.push(deleteDoc(d.ref).catch(() => {}));
+    });
+    auditSnap?.forEach((d) => {
+      deletions.push(deleteDoc(d.ref).catch(() => {}));
+    });
+    await Promise.all(deletions);
+
+    if (preserveAdminAuth && preservedAdmin) {
+      await setDoc(doc(firestoreDB, 'mirsad_registered_users', 'admin'), preservedAdmin).catch(() => {});
+    }
+
+    await setDoc(doc(firestoreDB, 'mirsad_admin_state', 'accounts_registry'), {
+      overrides: preserveAdminAuth && preservedAdmin ? { admin: preservedAdmin } : {},
+      resetAt: now,
+      updatedAt: now,
+    }).catch(() => {});
+  } catch {}
+
+  broadcastSyncUpdate();
+  return { ok: true, resetAt: now };
+}
+
+export async function ensureOneTimeFullResetEpoch(): Promise<boolean> {
+  if (!hasLocalStorage()) return false;
+  try {
+    if (localStorage.getItem(FULL_RESET_EPOCH_KEY) === '1') {
+      return false;
+    }
+    localStorage.setItem(FULL_RESET_EPOCH_KEY, '1');
+
+    // تحقق أولاً من وجود تصفير معتمد على السيرفر أو Firestore لتجنب مسح أي تسجيلات جديدة بعد التصفير
+    let remoteResetAt = 0;
+    try {
+      const serverState = await callServerAccountsApi('GET');
+      if (serverState && serverState.ok && Number(serverState.resetAt || 0) > 0) {
+        remoteResetAt = Math.max(remoteResetAt, Number(serverState.resetAt || 0));
+      }
+    } catch {}
+
+    try {
+      const stateSnap = await getDoc(doc(firestoreDB, 'mirsad_admin_state', 'accounts_registry'));
+      if (stateSnap.exists()) {
+        const data = stateSnap.data() as { resetAt?: number };
+        if (Number(data?.resetAt || 0) > 0) {
+          remoteResetAt = Math.max(remoteResetAt, Number(data.resetAt || 0));
+        }
+      }
+    } catch {}
+
+    if (remoteResetAt > getLastResetAt()) {
+      await applyLocalResetPurge(remoteResetAt, {
+        clearActiveSession: true,
+        preserveAdminAuth: true,
+      });
+    } else {
+      await resetAllAccountsAndLoginsGlobally({
+        clearActiveSession: true,
+        preserveAdminAuth: true,
+      });
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function getLocalAccountOverrides(): Record<string, CentralAccountOverride> {
@@ -359,20 +594,36 @@ async function performCloudAndServerSync(): Promise<{
 
   let serverSynced = false;
   let firestoreSynced = false;
+  let effectiveResetAt = getLastResetAt();
 
-  const localOverrides = getLocalAccountOverrides();
-  const deletedRaw = hasLocalStorage() ? localStorage.getItem(DELETED_USERS_STORAGE_KEY) : null;
-  const deletedSet = new Set<string>(deletedRaw ? JSON.parse(deletedRaw) : []);
-  const merged: Record<string, CentralAccountOverride> = { ...localOverrides };
+  let localOverrides = getLocalAccountOverrides();
+  let deletedRaw = hasLocalStorage() ? localStorage.getItem(DELETED_USERS_STORAGE_KEY) : null;
+  let deletedSet = new Set<string>(deletedRaw ? JSON.parse(deletedRaw) : []);
+  let merged: Record<string, CentralAccountOverride> = { ...localOverrides };
 
   // 1) Sync with Central Server / Netlify Function API (/api/accounts or /.netlify/functions/accounts)
   try {
     const serverRes = await callServerAccountsApi('POST', {
       action: 'SYNC_MERGE',
       localOverrides: merged,
+      localLoginLogs: getRealLoginLogs(),
+      lastResetAt: effectiveResetAt,
     });
     if (serverRes && serverRes.ok) {
       serverSynced = true;
+      const serverResetAt = Number(serverRes.resetAt || 0);
+      if (serverResetAt > effectiveResetAt) {
+        effectiveResetAt = serverResetAt;
+        await applyLocalResetPurge(serverResetAt, {
+          clearActiveSession: false,
+          preserveAdminAuth: true,
+        });
+        localOverrides = getLocalAccountOverrides();
+        deletedRaw = hasLocalStorage() ? localStorage.getItem(DELETED_USERS_STORAGE_KEY) : null;
+        deletedSet = new Set<string>(deletedRaw ? JSON.parse(deletedRaw) : []);
+        merged = { ...localOverrides };
+      }
+
       for (const delU of serverRes.deletedUsers || []) {
         const cd = String(delU || '').toLowerCase().trim();
         if (cd && cd !== 'admin') {
@@ -435,8 +686,8 @@ async function performCloudAndServerSync(): Promise<{
         }
       }
 
-      if (Array.isArray(serverRes.loginLogs) && serverRes.loginLogs.length > 0 && hasLocalStorage()) {
-        const localLogs = getRealLoginLogs();
+      if (Array.isArray(serverRes.loginLogs) && hasLocalStorage()) {
+        const localLogs = getRealLoginLogs().filter((l) => (l.timestamp || 0) >= effectiveResetAt);
         const logMap = new Map<string, LoginActivityRecord>();
         for (const l of localLogs) {
           const lu = (l.username || '').toLowerCase().trim();
@@ -444,7 +695,7 @@ async function performCloudAndServerSync(): Promise<{
           if (!deletedSet.has(lu) && (!la || !deletedSet.has(la))) logMap.set(l.id, l);
         }
         for (const l of serverRes.loginLogs) {
-          if (l && l.id) {
+          if (l && l.id && (l.timestamp || 0) >= effectiveResetAt) {
             const lu = (l.username || '').toLowerCase().trim();
             const la = (l.academicId || '').toLowerCase().trim();
             if (!deletedSet.has(lu) && (!la || !deletedSet.has(la))) logMap.set(l.id, l);
@@ -456,12 +707,75 @@ async function performCloudAndServerSync(): Promise<{
     }
   } catch {}
 
-  // 2) Sync with Google Cloud Firestore (mirsad_registered_users & mirsad_admin_state/accounts_registry)
+  // 2) Sync with Google Cloud Firestore (mirsad_registered_users, mirsad_admin_state/accounts_registry, mirsad_login_logs)
   try {
+    let pushedBackToServer = false;
+    const stateDoc = await getDoc(doc(firestoreDB, 'mirsad_admin_state', 'accounts_registry'));
+    if (stateDoc.exists()) {
+      firestoreSynced = true;
+      const stateData = stateDoc.data() as {
+        overrides?: Record<string, CentralAccountOverride>;
+        resetAt?: number;
+      };
+      const fsResetAt = Number(stateData.resetAt || 0);
+      if (fsResetAt > effectiveResetAt) {
+        effectiveResetAt = fsResetAt;
+        await applyLocalResetPurge(fsResetAt, {
+          clearActiveSession: false,
+          preserveAdminAuth: true,
+        });
+        deletedSet = new Set<string>();
+        merged = getLocalAccountOverrides();
+      }
+
+      for (const [k, rec] of Object.entries(stateData.overrides || {})) {
+        const cleanK = (rec.username || k).toLowerCase().trim();
+        if (!cleanK) continue;
+        const cleanAcad = (rec.academicId || '').toLowerCase().trim();
+        const existing = merged[cleanK];
+
+        if (rec.isDeleted && cleanK !== 'admin') {
+          deletedSet.add(cleanK);
+          if (cleanAcad) deletedSet.add(cleanAcad);
+          merged[cleanK] = {
+            ...existing,
+            ...rec,
+            username: cleanK,
+            isDeleted: true,
+            password: '',
+            passwordHash: '',
+            passwordSalt: '',
+          };
+          void deleteRecord('users', cleanK).catch(() => {});
+          continue;
+        }
+
+        if (deletedSet.has(cleanK) || (cleanAcad && deletedSet.has(cleanAcad))) {
+          continue;
+        }
+
+        if (!existing || (rec.updatedAt || 0) >= (existing.updatedAt || 0)) {
+          merged[cleanK] = {
+            ...existing,
+            ...rec,
+            username: cleanK,
+            isDeleted: false,
+            registrationSource: rec.registrationSource || existing?.registrationSource || 'self_register',
+            createdAt: rec.createdAt || existing?.createdAt || rec.updatedAt || Date.now(),
+            lastLoginAt: Math.max(rec.lastLoginAt || 0, existing?.lastLoginAt || 0) || undefined,
+            loginCount: Math.max(rec.loginCount || 0, existing?.loginCount || 0),
+            password: rec.password || existing?.password,
+            passwordHash: rec.passwordHash || existing?.passwordHash,
+            passwordSalt: rec.passwordSalt || existing?.passwordSalt,
+          };
+          pushedBackToServer = true;
+        }
+      }
+    }
+
     const regSnap = await getDocs(collection(firestoreDB, 'mirsad_registered_users'));
     firestoreSynced = true;
     const firestoreRecords = new Map<string, CentralAccountOverride>();
-    let pushedBackToServer = false;
 
     regSnap.forEach((docSnap) => {
       const rec = docSnap.data() as CentralAccountOverride;
@@ -509,54 +823,6 @@ async function performCloudAndServerSync(): Promise<{
       }
     });
 
-    const stateDoc = await getDoc(doc(firestoreDB, 'mirsad_admin_state', 'accounts_registry'));
-    if (stateDoc.exists()) {
-      const stateData = stateDoc.data() as { overrides?: Record<string, CentralAccountOverride> };
-      for (const [k, rec] of Object.entries(stateData.overrides || {})) {
-        const cleanK = (rec.username || k).toLowerCase().trim();
-        if (!cleanK) continue;
-        const cleanAcad = (rec.academicId || '').toLowerCase().trim();
-        const existing = merged[cleanK];
-
-        if (rec.isDeleted && cleanK !== 'admin') {
-          deletedSet.add(cleanK);
-          if (cleanAcad) deletedSet.add(cleanAcad);
-          merged[cleanK] = {
-            ...existing,
-            ...rec,
-            username: cleanK,
-            isDeleted: true,
-            password: '',
-            passwordHash: '',
-            passwordSalt: '',
-          };
-          void deleteRecord('users', cleanK).catch(() => {});
-          continue;
-        }
-
-        if (deletedSet.has(cleanK) || (cleanAcad && deletedSet.has(cleanAcad))) {
-          continue;
-        }
-
-        if (!existing || (rec.updatedAt || 0) >= (existing.updatedAt || 0)) {
-          merged[cleanK] = {
-            ...existing,
-            ...rec,
-            username: cleanK,
-            isDeleted: false,
-            registrationSource: rec.registrationSource || existing?.registrationSource || 'self_register',
-            createdAt: rec.createdAt || existing?.createdAt || rec.updatedAt || Date.now(),
-            lastLoginAt: Math.max(rec.lastLoginAt || 0, existing?.lastLoginAt || 0) || undefined,
-            loginCount: Math.max(rec.loginCount || 0, existing?.loginCount || 0),
-            password: rec.password || existing?.password,
-            passwordHash: rec.passwordHash || existing?.passwordHash,
-            passwordSalt: rec.passwordSalt || existing?.passwordSalt,
-          };
-          pushedBackToServer = true;
-        }
-      }
-    }
-
     // Push missing or newer active accounts back to Firestore so both sides stay 100% synced
     const registryUpdates: Record<string, CentralAccountOverride> = {};
     for (const [cleanK, rec] of Object.entries(merged)) {
@@ -573,16 +839,54 @@ async function performCloudAndServerSync(): Promise<{
       try {
         await setDoc(
           doc(firestoreDB, 'mirsad_admin_state', 'accounts_registry'),
-          { overrides: registryUpdates, updatedAt: Date.now() },
+          { overrides: registryUpdates, resetAt: effectiveResetAt, updatedAt: Date.now() },
           { merge: true }
         );
       } catch {}
     }
 
+    // مزامنة سجل عمليات تسجيل الدخول الفعلي مع Firestore (mirsad_login_logs)
+    try {
+      const logsQ = query(
+        collection(firestoreDB, 'mirsad_login_logs'),
+        orderBy('timestamp', 'desc'),
+        limit(200)
+      );
+      const logsSnap = await getDocs(logsQ);
+      if (hasLocalStorage()) {
+        const localLogs = getRealLoginLogs().filter((l) => (l.timestamp || 0) >= effectiveResetAt);
+        const logMap = new Map<string, LoginActivityRecord>();
+        for (const l of localLogs) {
+          const lu = (l.username || '').toLowerCase().trim();
+          const la = (l.academicId || '').toLowerCase().trim();
+          if (!deletedSet.has(lu) && (!la || !deletedSet.has(la))) logMap.set(l.id, l);
+        }
+        const fsLogIds = new Set<string>();
+        logsSnap.forEach((d) => {
+          const l = d.data() as LoginActivityRecord;
+          if (l && l.id && (l.timestamp || 0) >= effectiveResetAt) {
+            fsLogIds.add(l.id);
+            const lu = (l.username || '').toLowerCase().trim();
+            const la = (l.academicId || '').toLowerCase().trim();
+            if (!deletedSet.has(lu) && (!la || !deletedSet.has(la))) logMap.set(l.id, l);
+          }
+        });
+        for (const l of localLogs) {
+          if (!fsLogIds.has(l.id)) {
+            await setDoc(doc(firestoreDB, 'mirsad_login_logs', l.id), l, { merge: true }).catch(() => {});
+          }
+        }
+        const mergedLogs = Array.from(logMap.values()).sort((a, b) => b.timestamp - a.timestamp);
+        localStorage.setItem(LOGIN_LOGS_STORAGE_KEY, JSON.stringify(mergedLogs.slice(0, 300)));
+      }
+    } catch {}
+
     if (pushedBackToServer) {
       const pushRes = await callServerAccountsApi('POST', {
         action: 'SYNC_MERGE',
         localOverrides: merged,
+        localLoginLogs: getRealLoginLogs(),
+        lastResetAt: effectiveResetAt,
       });
       if (pushRes?.ok) serverSynced = true;
     }
@@ -704,6 +1008,51 @@ export function subscribeToCentralAccounts(onUpdate: () => void): () => void {
   } catch {}
 
   try {
+    const logsQ = query(
+      collection(firestoreDB, 'mirsad_login_logs'),
+      orderBy('timestamp', 'desc'),
+      limit(150)
+    );
+    const unsubLoginLogs = onSnapshot(
+      logsQ,
+      (snap) => {
+        if (hasLocalStorage()) {
+          const resetAt = getLastResetAt();
+          const deletedRaw = localStorage.getItem(DELETED_USERS_STORAGE_KEY);
+          const deletedSet = new Set<string>(deletedRaw ? JSON.parse(deletedRaw) : []);
+          const localLogs = getRealLoginLogs().filter((l) => (l.timestamp || 0) >= resetAt);
+          const logMap = new Map<string, LoginActivityRecord>();
+          for (const l of localLogs) {
+            const lu = (l.username || '').toLowerCase().trim();
+            const la = (l.academicId || '').toLowerCase().trim();
+            if (!deletedSet.has(lu) && (!la || !deletedSet.has(la))) {
+              logMap.set(l.id, l);
+            }
+          }
+          snap.forEach((d) => {
+            const l = d.data() as LoginActivityRecord;
+            if (l && l.id && (l.timestamp || 0) >= resetAt) {
+              const lu = (l.username || '').toLowerCase().trim();
+              const la = (l.academicId || '').toLowerCase().trim();
+              if (!deletedSet.has(lu) && (!la || !deletedSet.has(la))) {
+                logMap.set(l.id, l);
+              }
+            }
+          });
+          const mergedLogs = Array.from(logMap.values())
+            .sort((a, b) => b.timestamp - a.timestamp)
+            .slice(0, 300);
+          localStorage.setItem(LOGIN_LOGS_STORAGE_KEY, JSON.stringify(mergedLogs));
+          window.dispatchEvent(new CustomEvent('mirsad-login-logs-updated'));
+        }
+        onUpdate();
+      },
+      () => {}
+    );
+    unsubs.push(unsubLoginLogs);
+  } catch {}
+
+  try {
     if ('BroadcastChannel' in window) {
       const bc = new BroadcastChannel('mirsad_central_sync_v1');
       bc.onmessage = () => {
@@ -822,12 +1171,13 @@ export async function recordRealLoginActivity(params: {
   academicId: string;
   role: 'admin' | 'doctor' | 'user' | 'guest';
   status: 'success' | 'failed' | 'logout';
-  authMethod?: 'password' | 'google_oauth' | 'admin_reset';
+  authMethod?: 'password' | 'google_oauth' | 'admin_reset' | 'registration';
   note?: string;
 }): Promise<LoginActivityRecord> {
   const now = Date.now();
   const isoDate = new Date(now).toISOString();
   const cleanUsername = params.username.toLowerCase().trim();
+  const authMethod = params.authMethod || 'password';
 
   const existingLogs = getRealLoginLogs();
   const lastLog = existingLogs[0];
@@ -840,7 +1190,7 @@ export async function recordRealLoginActivity(params: {
       username: cleanUsername,
       role: params.role,
       status: params.status,
-      authMethod: params.authMethod || 'password',
+      authMethod,
       timestamp: now,
       userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : 'Server',
       note: params.note || '',
@@ -863,14 +1213,16 @@ export async function recordRealLoginActivity(params: {
     academicId: params.academicId || cleanUsername,
     role: params.role,
     status: params.status,
-    authMethod: params.authMethod || 'password',
+    authMethod,
     timestamp: now,
     isoDate,
     userAgent: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 90) : 'Web Browser',
     note:
       params.note ||
-      (params.status === 'success'
-        ? `تسجيل دخول فعلي معتمد (${params.role === 'admin' ? 'المشرف العام Admin' : 'حساب مستخدم مسجل'})`
+      (authMethod === 'registration'
+        ? 'فتح حساب جديد وتفعيله على المنصة'
+        : params.status === 'success'
+        ? `تسجيل دخول فعلي معتمد (${authMethod === 'google_oauth' ? 'Google OAuth' : params.role === 'admin' ? 'المشرف العام Admin' : 'حساب مستخدم مسجل'})`
         : params.status === 'logout'
         ? 'تسجيل خروج آمن وموثق'
         : `محاولة دخول غير ناجحة للمعرف (${cleanUsername})`),
@@ -883,9 +1235,10 @@ export async function recordRealLoginActivity(params: {
   if (hasLocalStorage()) {
     const updated = [entry, ...existingLogs].slice(0, 300);
     localStorage.setItem(LOGIN_LOGS_STORAGE_KEY, JSON.stringify(updated));
+    broadcastSyncUpdate();
   }
 
-  if (params.status === 'success') {
+  if (params.status === 'success' && authMethod !== 'registration') {
     const overrides = getLocalAccountOverrides();
     const prev = overrides[cleanUsername];
     const deletedRaw = hasLocalStorage() ? localStorage.getItem(DELETED_USERS_STORAGE_KEY) : null;
@@ -920,7 +1273,9 @@ export async function recordRealLoginActivity(params: {
     userId: cleanUsername,
     actorName: params.fullName,
     action:
-      params.status === 'success'
+      authMethod === 'registration'
+        ? 'USER_REGISTERED'
+        : params.status === 'success'
         ? 'USER_LOGIN_SUCCESS'
         : params.status === 'logout'
         ? 'USER_LOGOUT'
@@ -937,6 +1292,7 @@ export async function fetchAndMergeCloudLoginLogs(): Promise<LoginActivityRecord
   await syncAdminStateWithCloud();
   const deletedRaw = hasLocalStorage() ? localStorage.getItem(DELETED_USERS_STORAGE_KEY) : null;
   const deletedSet = new Set<string>(deletedRaw ? JSON.parse(deletedRaw) : []);
+  const resetAt = getLastResetAt();
 
   try {
     const q = query(
@@ -946,7 +1302,7 @@ export async function fetchAndMergeCloudLoginLogs(): Promise<LoginActivityRecord
     );
     const snap = await getDocs(q);
     if (!snap.empty && hasLocalStorage()) {
-      const localLogs = getRealLoginLogs();
+      const localLogs = getRealLoginLogs().filter((l) => (l.timestamp || 0) >= resetAt);
       const logMap = new Map<string, LoginActivityRecord>();
       for (const l of localLogs) {
         const lu = (l.username || '').toLowerCase().trim();
@@ -955,7 +1311,7 @@ export async function fetchAndMergeCloudLoginLogs(): Promise<LoginActivityRecord
       }
       snap.forEach((d) => {
         const l = d.data() as LoginActivityRecord;
-        if (l && l.id) {
+        if (l && l.id && (l.timestamp || 0) >= resetAt) {
           const lu = (l.username || '').toLowerCase().trim();
           const la = (l.academicId || '').toLowerCase().trim();
           if (!deletedSet.has(lu) && (!la || !deletedSet.has(la))) logMap.set(l.id, l);
@@ -967,6 +1323,7 @@ export async function fetchAndMergeCloudLoginLogs(): Promise<LoginActivityRecord
   } catch {}
 
   return getRealLoginLogs().filter((item) => {
+    if ((item.timestamp || 0) < resetAt) return false;
     const lu = (item.username || '').toLowerCase().trim();
     const la = (item.academicId || '').toLowerCase().trim();
     return !deletedSet.has(lu) && (!la || !deletedSet.has(la));

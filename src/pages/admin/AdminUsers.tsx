@@ -38,6 +38,7 @@ import {
   subscribeToCentralAccounts,
   pushAdminAccountOverride,
   getLocalAccountOverrides,
+  resetAllAccountsAndLoginsGlobally,
   LoginActivityRecord,
 } from '@/lib/centralAdminDB';
 import { removeDashboardUser } from '@/lib/dashboardData';
@@ -73,6 +74,9 @@ export default function AdminUsers() {
   const [editPasswordError, setEditPasswordError] = useState<string | null>(null);
   const [confirmDeleteUsername, setConfirmDeleteUsername] = useState<string | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showResetModal, setShowResetModal] = useState(false);
+  const [resettingNow, setResettingNow] = useState(false);
+  const [clearSessionOnReset, setClearSessionOnReset] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [createForm, setCreateForm] = useState({
     fullName: '',
@@ -356,6 +360,29 @@ export default function AdminUsers() {
     });
   };
 
+  const handleGlobalReset = async () => {
+    setResettingNow(true);
+    try {
+      await resetAllAccountsAndLoginsGlobally({
+        clearActiveSession: clearSessionOnReset,
+        preserveAdminAuth: true,
+      });
+      await initializeAuth();
+      setUsersList(getUsers());
+      setAccountOverrides(getLocalAccountOverrides());
+      setLoginLogs([]);
+      setShowResetModal(false);
+      setStatusMsg(
+        '✓ تم تصفير تسجيل الدخول للحسابات وإزالة جميع الحسابات المسجلة بالكامل عبر المتصفح والسيرفر والسحابة.'
+      );
+      if (clearSessionOnReset && typeof window !== 'undefined') {
+        window.setTimeout(() => window.location.reload(), 500);
+      }
+    } finally {
+      setResettingNow(false);
+    }
+  };
+
   // توليد الكود المصدري لمصفوفة PREHASHED_ACCOUNTS بالحسابات الفعلية المتبقية فقط بعد الحذف
   const exportedAccountsCode = useMemo(() => {
     const items = usersList.map((u) => ({
@@ -393,6 +420,14 @@ export default function AdminUsers() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowResetModal(true)}
+            className="px-3.5 py-2 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 font-bold text-xs flex items-center gap-1.5 border border-rose-500/40 cursor-pointer"
+          >
+            <Trash2 className="w-4 h-4" />
+            <span>تصفير تسجيل الدخول وإزالة جميع الحسابات</span>
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -518,18 +553,17 @@ export default function AdminUsers() {
                   const userLogs = loginLogs.filter(
                     (l) =>
                       l.status === 'success' &&
+                      l.authMethod !== 'registration' &&
                       (l.username.toLowerCase() === user.username.toLowerCase() ||
                         l.academicId.toLowerCase() === (user.academicId || '').toLowerCase())
                   );
                   const overrideInfo = accountOverrides[user.username.toLowerCase()];
                   const lastLoginTs =
                     userLogs[0]?.timestamp ||
-                    overrideInfo?.lastLoginAt ||
-                    (isSelf ? session?.loginTime : undefined);
+                    (overrideInfo?.lastLoginAt ? overrideInfo.lastLoginAt : undefined);
                   const totalLogins = Math.max(
                     userLogs.length,
-                    overrideInfo?.loginCount || 0,
-                    isSelf ? 1 : 0
+                    overrideInfo?.loginCount || 0
                   );
                   const regSource =
                     user.role === 'admin'
@@ -615,7 +649,7 @@ export default function AdminUsers() {
 
                           <div className="flex items-center gap-1 bg-slate-950 px-2 py-0.5 rounded-lg border border-slate-800 font-mono text-xs shrink-0">
                             <span className={cn('select-all font-bold', isRevealed ? 'text-amber-300' : 'text-slate-400')}>
-                              {isRevealed ? (realPassword || 'admin123') : '••••••••'}
+                              {isRevealed ? (realPassword || 'مشفّر (PBKDF2)') : '••••••••'}
                             </span>
                             <button
                               type="button"
@@ -627,7 +661,7 @@ export default function AdminUsers() {
                             </button>
                             <button
                               type="button"
-                              onClick={() => handleCopyPassword(user.username, realPassword || 'admin123')}
+                              onClick={() => handleCopyPassword(user.username, realPassword || '')}
                               className="text-slate-500 hover:text-emerald-400 p-0.5 cursor-pointer"
                               title="نسخ الرقم السري"
                             >
@@ -1060,6 +1094,55 @@ export default function AdminUsers() {
           setStatusMsg(msg);
         }}
       />
+
+      {showResetModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm" role="dialog" aria-modal="true" dir="rtl">
+          <div className="relative w-full max-w-md glass-panel rounded-3xl p-6 shadow-2xl border border-rose-500/40 bg-slate-900 space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
+              <h2 className="text-base font-black text-rose-300">
+                تأكيد تصفير تسجيل الدخول وإزالة جميع الحسابات
+              </h2>
+              <button
+                type="button"
+                onClick={() => setShowResetModal(false)}
+                className="w-8 h-8 rounded-xl bg-slate-800 text-slate-400 hover:text-white flex items-center justify-center cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              سيؤدي هذا الإجراء إلى مسح جميع الحسابات المسجلة وتصفير عدادات وسجلات الدخول فوراً عبر المتصفح، السيرفر، Cloud SQL، وFirestore.
+            </p>
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={clearSessionOnReset}
+                onChange={(e) => setClearSessionOnReset(e.target.checked)}
+                className="rounded border-slate-700 bg-slate-950 text-rose-500"
+              />
+              <span>تسجيل خروج جلستي الحالية أيضاً بعد التصفير</span>
+            </label>
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={resettingNow}
+                onClick={() => setShowResetModal(false)}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-slate-800 text-slate-300 hover:bg-slate-700 cursor-pointer"
+              >
+                إلغاء
+              </button>
+              <button
+                type="button"
+                disabled={resettingNow}
+                onClick={() => void handleGlobalReset()}
+                className="px-5 py-2 rounded-xl text-xs font-black bg-rose-600 hover:bg-rose-500 disabled:opacity-60 text-white cursor-pointer"
+              >
+                {resettingNow ? '⏳ جاري التصفير...' : 'تأكيد التصفير الكامل الآن'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

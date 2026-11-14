@@ -17,6 +17,7 @@ interface ServerDBState {
   overrides: Record<string, Record<string, unknown>>;
   deletedUsers: string[];
   loginLogs: Array<Record<string, unknown>>;
+  resetAt: number;
   updatedAt: number;
 }
 
@@ -25,6 +26,7 @@ function loadServerDB(): ServerDBState {
     overrides: {},
     deletedUsers: [],
     loginLogs: [],
+    resetAt: 0,
     updatedAt: Date.now(),
   };
   for (const filePath of [PERSISTENT_ACCOUNTS_DB_FILE, TMP_ACCOUNTS_DB_FILE]) {
@@ -39,9 +41,10 @@ function loadServerDB(): ServerDBState {
               ...(Array.isArray(parsed.deletedUsers) ? parsed.deletedUsers : []),
             ])
           );
-          if (Array.isArray(parsed.loginLogs) && parsed.loginLogs.length > 0) {
+          if (Array.isArray(parsed.loginLogs)) {
             state.loginLogs = parsed.loginLogs;
           }
+          state.resetAt = Math.max(state.resetAt, Number(parsed.resetAt || 0));
           state.updatedAt = Math.max(state.updatedAt, parsed.updatedAt || Date.now());
         }
       }
@@ -86,6 +89,18 @@ export default defineConfig(({ command }) => ({
             'Cache-Control',
             'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0'
           );
+          res.setHeader('Access-Control-Allow-Origin', '*');
+          res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+          res.setHeader(
+            'Access-Control-Allow-Headers',
+            'Content-Type, Cache-Control, Pragma, Authorization'
+          );
+
+          if (req.method === 'OPTIONS') {
+            res.statusCode = 204;
+            res.end('');
+            return;
+          }
 
           if (req.method === 'GET') {
             const db = loadServerDB();
@@ -105,7 +120,33 @@ export default defineConfig(({ command }) => ({
                 const db = loadServerDB();
                 const action = body.action;
 
-                if (action === 'UPSERT_USER' && body.account) {
+                if (action === 'RESET_ALL') {
+                  const now = Date.now();
+                  const prevAdmin = db.overrides?.admin;
+                  const nextOverrides: Record<string, Record<string, unknown>> = {};
+                  if (body.preserveAdminAuth && prevAdmin && prevAdmin.passwordHash) {
+                    nextOverrides.admin = {
+                      username: 'admin',
+                      academicId: prevAdmin.academicId || 'ADMIN-001',
+                      fullName: prevAdmin.fullName || 'المشرف العام على المنصة',
+                      role: 'admin',
+                      registrationSource: 'system_admin',
+                      passwordHash: prevAdmin.passwordHash,
+                      passwordSalt: prevAdmin.passwordSalt,
+                      isDeleted: false,
+                      deletedAt: 0,
+                      lastLoginAt: 0,
+                      loginCount: 0,
+                      createdAt: prevAdmin.createdAt || now,
+                      updatedAt: now,
+                    };
+                  }
+                  db.overrides = nextOverrides;
+                  db.deletedUsers = [];
+                  db.loginLogs = [];
+                  db.resetAt = Math.max(Number(body.resetAt || 0), now);
+                  saveServerDB(db);
+                } else if (action === 'UPSERT_USER' && body.account) {
                   const acc = body.account;
                   const cleanU = String(acc.username || '').toLowerCase().trim();
                   const cleanAcad = String(acc.academicId || '').toLowerCase().trim();
@@ -147,6 +188,15 @@ export default defineConfig(({ command }) => ({
                     delSet.add(cleanU);
                     if (resolvedAcad) delSet.add(resolvedAcad);
                     db.deletedUsers = Array.from(delSet);
+                    db.loginLogs = (db.loginLogs || []).filter((l) => {
+                      const lu = String(l.username || '').toLowerCase().trim();
+                      const la = String(l.academicId || '').toLowerCase().trim();
+                      return (
+                        lu !== cleanU &&
+                        la !== cleanU &&
+                        (!resolvedAcad || (lu !== resolvedAcad && la !== resolvedAcad))
+                      );
+                    });
                     saveServerDB(db);
                   }
                 } else if (action === 'ADD_LOGIN_LOG' && body.log) {
@@ -154,41 +204,98 @@ export default defineConfig(({ command }) => ({
                   if (!db.loginLogs.some((x) => x.id === log.id)) {
                     db.loginLogs = [log, ...db.loginLogs].slice(0, 300);
                   }
-                  saveServerDB(db);
-                } else if (action === 'SYNC_MERGE' && body.localOverrides) {
+                  const lu = String(log.username || '').toLowerCase().trim();
                   const delSet = new Set(db.deletedUsers || []);
-                  for (const [k, rec] of Object.entries(
-                    body.localOverrides as Record<string, Record<string, unknown>>
-                  )) {
-                    const cleanK = String(rec.username || k).toLowerCase().trim();
-                    if (!cleanK) continue;
-                    const cleanAcad = String(rec.academicId || '').toLowerCase().trim();
-                    if (rec.isDeleted && cleanK !== 'admin') {
-                      delSet.add(cleanK);
-                      if (cleanAcad) delSet.add(cleanAcad);
-                      db.overrides[cleanK] = {
-                        ...rec,
-                        username: cleanK,
-                        isDeleted: true,
-                        updatedAt: Number(rec.updatedAt) || Date.now(),
+                  if (
+                    lu &&
+                    log.status === 'success' &&
+                    log.authMethod !== 'registration' &&
+                    !delSet.has(lu)
+                  ) {
+                    const prev = db.overrides[lu] || {
+                      username: lu,
+                      role: log.role || 'user',
+                      createdAt: log.timestamp || Date.now(),
+                    };
+                    if (!prev.isDeleted) {
+                      db.overrides[lu] = {
+                        ...prev,
+                        username: lu,
+                        academicId: prev.academicId || log.academicId || lu,
+                        fullName: prev.fullName || log.fullName || lu,
+                        lastLoginAt: Math.max(
+                          Number(prev.lastLoginAt || 0),
+                          Number(log.timestamp || Date.now())
+                        ),
+                        loginCount: Number(prev.loginCount || 0) + 1,
+                        updatedAt: Date.now(),
                       };
-                    } else if (!delSet.has(cleanK) && (!cleanAcad || !delSet.has(cleanAcad))) {
-                      const existing = db.overrides[cleanK];
-                      if (
-                        !existing ||
-                        (Number(rec.updatedAt || 0) >= Number(existing.updatedAt || 0) &&
-                          !existing.isDeleted)
-                      ) {
-                        db.overrides[cleanK] = {
-                          ...existing,
-                          ...rec,
-                          username: cleanU_or_K(cleanK),
-                        };
-                      }
                     }
                   }
-                  db.deletedUsers = Array.from(delSet);
                   saveServerDB(db);
+                } else if (action === 'SYNC_MERGE' && body.localOverrides) {
+                  const clientSyncBaseline = Number(body.lastResetAt || 0);
+                  const serverResetAt = Number(db.resetAt || 0);
+                  const allowMergeFromClient =
+                    serverResetAt === 0 || clientSyncBaseline >= serverResetAt;
+
+                  if (allowMergeFromClient) {
+                    const delSet = new Set(db.deletedUsers || []);
+                    for (const [k, rec] of Object.entries(
+                      body.localOverrides as Record<string, Record<string, unknown>>
+                    )) {
+                      const cleanK = String(rec.username || k).toLowerCase().trim();
+                      if (!cleanK) continue;
+                      const cleanAcad = String(rec.academicId || '').toLowerCase().trim();
+                      if (rec.isDeleted && cleanK !== 'admin') {
+                        delSet.add(cleanK);
+                        if (cleanAcad) delSet.add(cleanAcad);
+                        db.overrides[cleanK] = {
+                          ...rec,
+                          username: cleanK,
+                          isDeleted: true,
+                          updatedAt: Number(rec.updatedAt) || Date.now(),
+                        };
+                      } else if (!delSet.has(cleanK) && (!cleanAcad || !delSet.has(cleanAcad))) {
+                        const existing = db.overrides[cleanK];
+                        if (
+                          !existing ||
+                          (Number(rec.updatedAt || 0) >= Number(existing.updatedAt || 0) &&
+                            !existing.isDeleted)
+                        ) {
+                          db.overrides[cleanK] = {
+                            ...existing,
+                            ...rec,
+                            username: cleanU_or_K(cleanK),
+                          };
+                        }
+                      }
+                    }
+                    if (Array.isArray(body.localLoginLogs)) {
+                      const logMap = new Map<string, Record<string, unknown>>();
+                      for (const l of db.loginLogs || []) {
+                        if (l && typeof l.id === 'string') logMap.set(l.id, l);
+                      }
+                      for (const l of body.localLoginLogs as Array<Record<string, unknown>>) {
+                        if (
+                          l &&
+                          typeof l.id === 'string' &&
+                          Number(l.timestamp || 0) >= serverResetAt
+                        ) {
+                          const lu = String(l.username || '').toLowerCase().trim();
+                          const la = String(l.academicId || '').toLowerCase().trim();
+                          if (!delSet.has(lu) && (!la || !delSet.has(la))) {
+                            logMap.set(l.id, l);
+                          }
+                        }
+                      }
+                      db.loginLogs = Array.from(logMap.values())
+                        .sort((a, b) => Number(b.timestamp || 0) - Number(a.timestamp || 0))
+                        .slice(0, 300);
+                    }
+                    db.deletedUsers = Array.from(delSet);
+                    saveServerDB(db);
+                  }
                 }
 
                 res.statusCode = 200;

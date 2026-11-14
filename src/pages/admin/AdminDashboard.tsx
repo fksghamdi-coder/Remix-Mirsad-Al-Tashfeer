@@ -26,6 +26,7 @@ import {
   subscribeToCentralAccounts,
   pushAdminAccountOverride,
   getLocalAccountOverrides,
+  resetAllAccountsAndLoginsGlobally,
   NETLIFY_PROJECT_OVERVIEW_URL,
   LoginActivityRecord,
   RealSyncReport,
@@ -40,6 +41,9 @@ export default function AdminDashboard({ inModal = false }: { inModal?: boolean 
   const [syncingNow, setSyncingNow] = useState(false);
   const [lastSyncReport, setLastSyncReport] = useState<RealSyncReport | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showResetModal, setShowResetModal] = useState(false);
+  const [resettingNow, setResettingNow] = useState(false);
+  const [clearSessionOnReset, setClearSessionOnReset] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [activeLogTab, setActiveLogTab] = useState<'LOGIN_LOGS' | 'AUDIT_LOGS'>('LOGIN_LOGS');
@@ -104,6 +108,7 @@ export default function AdminDashboard({ inModal = false }: { inModal?: boolean 
       setUsers(getUsers());
       setAccountOverrides(getLocalAccountOverrides());
       setLoginLogs(getRealLoginLogs());
+      setAuditLogs(getStoredAuditLogs());
     });
     window.addEventListener('mirsad-users-updated', onUpdated);
     window.addEventListener('mirsad-login-logs-updated', onUpdated);
@@ -234,6 +239,30 @@ export default function AdminDashboard({ inModal = false }: { inModal?: boolean 
     setCreateForm({ fullName: '', academicId: '', password: '', phone: '', role: 'user' });
   };
 
+  const handleGlobalReset = async () => {
+    setResettingNow(true);
+    try {
+      await resetAllAccountsAndLoginsGlobally({
+        clearActiveSession: clearSessionOnReset,
+        preserveAdminAuth: true,
+      });
+      await initializeAuth();
+      setUsers(getUsers());
+      setAccountOverrides(getLocalAccountOverrides());
+      setLoginLogs([]);
+      setAuditLogs([]);
+      setShowResetModal(false);
+      setStatusMessage(
+        '✓ تم تصفير جميع عمليات وسجلات تسجيل الدخول وإزالة جميع الحسابات المسجلة وتنظيف السيرفر والسحابة بالكامل (0 عملية دخول).'
+      );
+      if (clearSessionOnReset && typeof window !== 'undefined') {
+        window.setTimeout(() => window.location.reload(), 500);
+      }
+    } finally {
+      setResettingNow(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-24">
@@ -258,6 +287,13 @@ export default function AdminDashboard({ inModal = false }: { inModal?: boolean 
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            onClick={() => setShowResetModal(true)}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold border bg-rose-500/15 text-rose-200 border-rose-500/40 hover:bg-rose-500/25 cursor-pointer transition-all"
+          >
+            <span>🧹 تصفير تسجيل الدخول وإزالة جميع الحسابات</span>
+          </button>
           <button
             type="button"
             onClick={() => void refreshUsersList(true)}
@@ -330,7 +366,12 @@ export default function AdminDashboard({ inModal = false }: { inModal?: boolean 
               { x: 1, y: users.length, label: 'الإجمالي', value: users.length },
               { x: 2, y: selfRegisteredUsers.length, label: 'تسجيل ذاتي', value: selfRegisteredUsers.length },
               { x: 3, y: adminCreatedUsers.length, label: 'مضاف أدمن', value: adminCreatedUsers.length },
-              { x: 4, y: loginLogs.filter((l) => l.status === 'success').length, label: 'دخول ناجح', value: loginLogs.filter((l) => l.status === 'success').length },
+              {
+                x: 4,
+                y: loginLogs.filter((l) => l.status === 'success' && l.authMethod !== 'registration').length,
+                label: 'دخول ناجح',
+                value: loginLogs.filter((l) => l.status === 'success' && l.authMethod !== 'registration').length,
+              },
             ]}
             height={160}
           />
@@ -430,10 +471,11 @@ export default function AdminDashboard({ inModal = false }: { inModal?: boolean 
                 const userSuccessLogs = loginLogs.filter(
                   (l) =>
                     l.status === 'success' &&
+                    l.authMethod !== 'registration' &&
                     (l.username.toLowerCase() === cleanU ||
                       l.academicId.toLowerCase() === (u.academicId || '').toLowerCase())
                 );
-                const lastLoginTs = userSuccessLogs[0]?.timestamp || ov?.lastLoginAt;
+                const lastLoginTs = userSuccessLogs[0]?.timestamp || ov?.lastLoginAt || undefined;
                 const loginCount = Math.max(userSuccessLogs.length, ov?.loginCount || 0);
 
                 return (
@@ -740,6 +782,53 @@ export default function AdminDashboard({ inModal = false }: { inModal?: boolean 
               </button>
             </div>
           </form>
+        </div>
+      )}
+      {/* نافذة تأكيد تصفير تسجيل الدخول وإزالة جميع الحسابات */}
+      {showResetModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm" role="dialog" aria-modal="true">
+          <div className="relative w-full max-w-md glass-panel rounded-3xl p-6 shadow-2xl border border-rose-500/40 bg-slate-900 space-y-4">
+            <h2 className="text-lg font-black text-rose-300">
+              تأكيد تصفير تسجيل الدخول وإزالة جميع الحسابات
+            </h2>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              سيتم تنفيذ عملية تصفير شاملة وفورية عبر المتصفح، السيرفر، Cloud SQL، وFirestore:
+            </p>
+            <ul className="text-xs text-slate-400 space-y-1.5 list-disc pr-5">
+              <li>إزالة جميع الحسابات غير الإدارية نهائياً.</li>
+              <li>تصفير عدادات الدخول (<span className="font-mono text-rose-300">0</span>) ومسح جميع سجلات الدخول والتدقيق.</li>
+              <li>توثيق أي عملية دخول جديدة لاحقاً بشكل فوري ومتزامن في الداش بورد.</li>
+            </ul>
+
+            <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer pt-1">
+              <input
+                type="checkbox"
+                checked={clearSessionOnReset}
+                onChange={(e) => setClearSessionOnReset(e.target.checked)}
+                className="rounded border-slate-700 bg-slate-950 text-rose-500"
+              />
+              <span>تسجيل خروج جلستي الحالية أيضاً بعد التصفير</span>
+            </label>
+
+            <div className="flex items-center justify-end gap-2 pt-2">
+              <button
+                type="button"
+                disabled={resettingNow}
+                onClick={() => setShowResetModal(false)}
+                className="px-4 py-2 rounded-xl text-xs font-bold bg-slate-800 text-slate-300 hover:bg-slate-700 cursor-pointer"
+              >
+                إلغاء
+              </button>
+              <button
+                type="button"
+                disabled={resettingNow}
+                onClick={() => void handleGlobalReset()}
+                className="px-5 py-2 rounded-xl text-xs font-black bg-rose-600 hover:bg-rose-500 disabled:opacity-60 text-white cursor-pointer shadow-lg transition-all"
+              >
+                {resettingNow ? '⏳ جاري التصفير...' : 'تأكيد التصفير الكامل الآن'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
