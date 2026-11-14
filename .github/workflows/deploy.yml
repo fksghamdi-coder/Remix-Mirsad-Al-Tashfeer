@@ -50,3 +50,14 @@ jobs:
           git add -A
           git commit -m "Force deploy build $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
+
+      - name: Deploy directly to Netlify (when secrets are configured)
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+        run: |
+          if [ -n "$NETLIFY_AUTH_TOKEN" ] && [ -n "$NETLIFY_SITE_ID" ]; then
+            npx --yes netlify-cli deploy --prod --dir=dist --functions=netlify/functions
+          else
+            echo "Skipping direct Netlify CLI deploy (NETLIFY_AUTH_TOKEN / NETLIFY_SITE_ID not set)."
+          fi
