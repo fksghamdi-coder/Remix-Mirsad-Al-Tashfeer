@@ -266,7 +266,7 @@ export default defineConfig(({ command }) => ({
                           db.overrides[cleanK] = {
                             ...existing,
                             ...rec,
-                            username: cleanU_or_K(cleanK),
+                            username: cleanK,
                           };
                         }
                       }
@@ -475,8 +475,4 @@ self.addEventListener('fetch', (event) => {
   },
   server: { port: 3000, host: '0.0.0.0', hmr: false },
 }));
-
-function cleanU_or_K(val: string): string {
-  return val;
-}
 

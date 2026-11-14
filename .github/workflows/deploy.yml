@@ -34,6 +34,11 @@ jobs:
       - name: Install dependencies
         run: npm install --legacy-peer-deps
 
+      - name: Verify source data and TypeScript types
+        run: |
+          test -d src/data || (echo "ERROR: src/data directory is missing from repository!" && exit 1)
+          npm run lint
+
       - name: Build production bundle
         env:
           CI: false
@@ -43,12 +48,13 @@ jobs:
         continue-on-error: true
         run: |
           cd dist
+          touch .nojekyll
           git init
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b gh-pages
-          git add -A
-          git commit -m "Force deploy build $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          git add -A --force
+          git commit --allow-empty -m "Force deploy build $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" gh-pages
 
       - name: Deploy directly to Netlify (when secrets are configured)
