@@ -1,0 +1,8 @@
+{
+  "name": "Remix مِرْصَاد التشفير | Mirsad Al-Tashfeer",
+  "description": "منصة وطنية وأكاديمية متطورة للتحليل الأمني وهندسة التشفير المتقدم (ISE243) بقاعدة بيانات مركزية ومختبرات تفاعلية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,11 +1,35 @@
-<div align="center">
+# 🧪 دليل الاختبارات — مِرْصَاد التشفير
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+## التثبيت
 
-  <h1>Built with AI Studio</h2>
+```bash
+npm install
+npx playwright install chromium
+```
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## التشغيل
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+```bash
+# تشغيل كل الاختبارات
+npm test
 
-</div>
+# تشغيل ملف محدد
+npx playwright test tests/01-auth.spec.ts
+
+# تشغيل الواجهة المرئية
+npm run test:ui
+
+# استعراض التقرير التفاعلي
+npm run test:report
+```
+
+## هيكل الاختبارات
+
+| الملف | ما يغطيه |
+|-------|----------|
+| `01-auth.spec.ts` | تسجيل الدخول، وضع الزوار، Rate Limiting، الحماية |
+| `02-main-portal.spec.ts` | الداشبورد، المقارنات، السجل التاريخي، التعريفات |
+| `03-academic.spec.ts` | الفصول، المخططات الفنية، ZKP، الفريق، الاختبار |
+| `04-admin.spec.ts` | إنشاء المستخدمين، الفصول، الحماية السيبرانية |
+| `05-features.spec.ts` | الوضع الليلي والنهاري، البحث الشامل، PWA والتجاوب |
+| `06-flow.spec.ts` | السيناريو المتكامل E2E من الإنشاء حتى الشهادة |

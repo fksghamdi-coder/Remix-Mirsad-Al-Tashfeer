@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <script>
+      (function () {
+        // 1. استعادة المسار الأصلي في GitHub Pages بعد التحويل من 404.html
+        try {
+          var savedRedirect = sessionStorage.getItem('mirsad_gh_redirect');
+          if (savedRedirect) {
+            sessionStorage.removeItem('mirsad_gh_redirect');
+            window.history.replaceState(null, '', savedRedirect);
+          }
+        } catch (e) {}
+
+        // 2. تنظيف أي Service Worker قديم عالق في متصفح المستخدم على GitHub Pages لمرة واحدة
+        try {
+          if (
+            window.location.hostname.endsWith('github.io') &&
+            localStorage.getItem('mirsad_gh_sw_purge_v6') !== '1'
+          ) {
+            localStorage.setItem('mirsad_gh_sw_purge_v6', '1');
+            if ('serviceWorker' in navigator) {
+              navigator.serviceWorker.getRegistrations().then(function (regs) {
+                regs.forEach(function (r) {
+                  r.unregister();
+                });
+              });
+            }
+            if ('caches' in window) {
+              caches.keys().then(function (keys) {
+                keys.forEach(function (k) {
+                  caches.delete(k);
+                });
+              });
+            }
+          }
+        } catch (e) {}
+
+        // 3. منع أخطاء WebSocket الخاصة بـ Vite HMR في البيئات السحابية التي تعطل HMR
+        window.addEventListener('unhandledrejection', function (e) {
+          var msg = e && e.reason ? (e.reason.message || String(e.reason)) : '';
+          if (
+            msg.indexOf('WebSocket closed without opened') !== -1 ||
+            msg.indexOf('failed to connect to websocket') !== -1
+          ) {
+            e.preventDefault();
+          }
+        });
+        var OrigWebSocket = window.WebSocket;
+        if (OrigWebSocket) {
+          function PatchedWebSocket(url, protocols) {
+            var protoStr = Array.isArray(protocols) ? protocols.join(',') : String(protocols || '');
+            if (protoStr.indexOf('vite-hmr') !== -1 || protoStr.indexOf('vite-ping') !== -1) {
+              var dummy = new EventTarget();
+              dummy.readyState = 1;
+              dummy.url = String(url || '');
+              dummy.protocol = protoStr;
+              dummy.bufferedAmount = 0;
+              dummy.extensions = '';
+              dummy.binaryType = 'blob';
+              dummy.send = function () {};
+              dummy.close = function () {
+                dummy.readyState = 3;
+              };
+              return dummy;
+            }
+            return protocols !== undefined ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+          }
+          PatchedWebSocket.prototype = OrigWebSocket.prototype;
+          PatchedWebSocket.CONNECTING = 0;
+          PatchedWebSocket.OPEN = 1;
+          PatchedWebSocket.CLOSING = 2;
+          PatchedWebSocket.CLOSED = 3;
+          window.WebSocket = PatchedWebSocket;
+        }
+      })();
+    </script>
+    <link rel="icon" type="image/svg+xml" href="./icons/icon-192.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover" />
+    
+    <title>مِرْصَاد التشفير | Mirsad Al-Tashfeer</title>
+    <meta name="description" content="مشروع مِرْصَاد التشفير الأكاديمي التدريبي للعلوم التشفيرية والأمن السيبراني — مشروع أكاديمي تعليمي وتدريبي حقيقي موثق بالمصادر الرسمية والأكاديمية المعتمدة (وليس منصة حكومية أو تجارية رسمية) لمادة التشفير المتقدم (ISE243) — تخصص دبلوم أمن المعلومات — طلاب شعبة (002م) — السنة الأكاديمية (2026-2027) — جامعة الأمير مقرن بن عبدالعزيز." />
+    <meta property="og:title" content="مِرْصَاد التشفير | Mirsad Al-Tashfeer" />
+    <meta property="og:description" content="مشروع مِرْصَاد التشفير الأكاديمي التدريبي للعلوم التشفيرية والأمن السيبراني — مشروع أكاديمي تعليمي وتدريبي حقيقي موثق بالمصادر الرسمية والأكاديمية المعتمدة (وليس منصة حكومية أو تجارية رسمية) لمادة التشفير المتقدم (ISE243) — تخصص دبلوم أمن المعلومات — طلاب شعبة (002م) — السنة الأكاديمية (2026-2027) — جامعة الأمير مقرن بن عبدالعزيز." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    
+    <!-- PWA -->
+    <link rel="manifest" href="./manifest.json" />
+    <meta name="theme-color" content="#020617" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="مِرْصَاد" />
+    <link rel="apple-touch-icon" href="./icons/icon-192.svg" />
+    
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;600;700;800;900&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+    
+    <!-- Splash color -->
+    <style>
+      html { background-color: #020617; }
+      html[data-theme="light"] { background-color: #f8fafc; }
+    </style>
+  </head>
+  <body class="bg-slate-950 text-slate-50 antialiased selection:bg-emerald-500/30 selection:text-emerald-200">
+    <div id="root"></div>
+    <script type="module" src="./src/main.tsx"></script>
+  </body>
+</html>

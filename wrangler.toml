@@ -1,0 +1,7 @@
+name = "mirsad-altashfeer"
+compatibility_date = "2024-01-01"
+pages_build_output_dir = "dist"
+
+[vars]
+ENVIRONMENT = "production"
+SECURITY_LEVEL = "STRICT_NCA_ECC_2018"

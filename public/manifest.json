@@ -1,0 +1,52 @@
+{
+  "name": "مِرْصَاد التشفير — Mirsad Al-Tashfeer",
+  "short_name": "مِرْصَاد",
+  "description": "منصة تعليمية أكاديمية للتشفير والأمن السيبراني — مقرر ISE243",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "theme_color": "#020617",
+  "background_color": "#020617",
+  "lang": "ar",
+  "dir": "rtl",
+  "categories": [
+    "education",
+    "security",
+    "productivity"
+  ],
+  "icons": [
+    {
+      "src": "/icons/icon-192.svg",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icons/icon-512.svg",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "المنصة الأكاديمية",
+      "short_name": "الأكاديمية",
+      "url": "/academic",
+      "description": "الفصول الأكاديمية والمختبرات"
+    },
+    {
+      "name": "الاختبار النهائي",
+      "short_name": "الاختبار",
+      "url": "/academic/final-quiz",
+      "description": "الاختبار النهائي الشامل"
+    },
+    {
+      "name": "شهادتي",
+      "short_name": "الشهادة",
+      "url": "/certificate",
+      "description": "شهادة إتمام المقرر"
+    }
+  ]
+}
