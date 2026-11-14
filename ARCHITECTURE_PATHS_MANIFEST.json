@@ -1,0 +1,25 @@
+{
+  "manifest_version": "4.0.0",
+  "project_name": "مِرْصَاد التشفير (Mirsad Al-Tashfeer)",
+  "target_capacity": "500+ Concurrent Students",
+  "security_level": "Strict NIST / NCA ECC-1:2018 Compliant",
+  "offline_first": true,
+  "paths": {
+    "hybrid_database": "src/lib/database/HybridDatabaseEngine.ts",
+    "service_worker": "public/sw.js",
+    "server_entry": "server.ts",
+    "cloudflare_worker": "functions/api/[[route]].ts",
+    "crypto_web_worker": "src/workers/cryptoEngine.worker.ts",
+    "interactive_crypto_lab": "src/pages/main/InteractiveCryptoLab.tsx",
+    "internal_notebook": "src/components/ui/InternalNotebook.tsx",
+    "main_nav": "src/components/MainNav.tsx",
+    "main_layout": "src/components/MainLayout.tsx",
+    "academic_types": "src/types/academic.ts",
+    "course_ise232_chapters": "src/data/courses/ise232-programs/chapters.ts",
+    "academic_container": "src/components/academic/AcademicModeContainer.tsx",
+    "interactive_3d_book": "src/components/interactive/Interactive3DBookEngine.tsx",
+    "certificate_preview": "src/components/ui/CertificatePreview.tsx",
+    "course_chapter_view": "src/pages/academic/CourseChapterView.tsx",
+    "courses_index": "src/data/courses/index.ts"
+  }
+}

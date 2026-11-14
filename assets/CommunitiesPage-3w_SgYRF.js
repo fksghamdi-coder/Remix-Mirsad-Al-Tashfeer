@@ -1,0 +1,1 @@
+import"./rolldown-runtime-XKyaHtl9.js";import{n as e,t}from"./jsx-runtime-C3cWAN_r.js";import{t as n}from"./AcademicCommunities-HHQGXQmS.js";e();var r=t();function i(){return(0,r.jsx)(`div`,{className:`max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6`,children:(0,r.jsx)(n,{})})}export{i as default};

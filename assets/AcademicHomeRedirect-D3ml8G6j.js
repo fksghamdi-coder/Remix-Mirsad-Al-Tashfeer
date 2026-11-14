@@ -1,0 +1,1 @@
+import{t as e}from"./jsx-runtime-C3cWAN_r.js";import{l as t,r as n}from"./chunk-OB3PAWPO-C3i9-y3h.js";import{w as r}from"./mirsad-app-DeipPcgp.js";var i=e();function a(){let{courseSlug:e}=t(),a=r(e||``);return!a||a.status!==`available`?(0,i.jsx)(n,{to:`/academic`,replace:!0}):(0,i.jsx)(n,{to:`/academic/${e}/chapters`,replace:!0})}export{a as default};
